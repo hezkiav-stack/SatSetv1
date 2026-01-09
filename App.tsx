@@ -58,7 +58,7 @@ const App: React.FC = () => {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
 
-  // --- TIMER STATE ---
+  // --- TIMER & STATS STATE ---
   const [phase, setPhase] = useState<Phase>('work');
   const [isActive, setIsActive] = useState(false);
   const [timeLeft, setTimeLeft] = useState(appSettings.pomodoro.work * 60);
@@ -66,21 +66,11 @@ const App: React.FC = () => {
   const [cycleCount, setCycleCount] = useState(0);
   const timerRef = useRef<number | null>(null);
 
-  const [dailyStats, setDailyStats] = useState(() => {
-    const today = new Date().toDateString();
-    const saved = localStorage.getItem('pomodoro-stats-v2');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (parsed.date === today) return parsed;
-      } catch {}
-    }
-    return { date: today, count: 0, totalSeconds: 0 };
+  const [dailyStats, setDailyStats] = useState({ 
+    date: new Date().toDateString(), 
+    count: 0, 
+    totalSeconds: 0 
   });
-
-  useEffect(() => {
-    localStorage.setItem('pomodoro-stats-v2', JSON.stringify(dailyStats));
-  }, [dailyStats]);
 
   // --- AUTH ---
   useEffect(() => {
@@ -89,7 +79,10 @@ const App: React.FC = () => {
         const { data: { session }, error } = await supabase.auth.getSession();
         if (error) throw error;
         setSession(session);
-        if (session) await fetchTasks();
+        if (session) {
+          await fetchTasks();
+          await fetchPomodoroStats(session.user.id);
+        }
       } catch (error: any) {
         console.error("Auth session error:", error.message);
       } finally {
@@ -101,14 +94,19 @@ const App: React.FC = () => {
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
-      if (session) fetchTasks();
-      else setTasks([]);
+      if (session) {
+        fetchTasks();
+        fetchPomodoroStats(session.user.id);
+      } else {
+        setTasks([]);
+        setDailyStats({ date: new Date().toDateString(), count: 0, totalSeconds: 0 });
+      }
     });
 
     return () => subscription.unsubscribe();
   }, []);
 
-  // --- API CALLS ---
+  // --- API CALLS: TASKS ---
   const fetchTasks = async () => {
     setIsDataLoading(true);
     try {
@@ -189,9 +187,65 @@ const App: React.FC = () => {
     }
   };
 
-  // --- TIMER LOGIC (CRITICAL FIXES HERE) ---
+  // --- API CALLS: POMODORO STATS ---
+  const fetchPomodoroStats = async (userId: string) => {
+    const today = new Date().toDateString();
+    try {
+      const { data, error } = await supabase
+        .from('pomodoro_stats')
+        .select('*')
+        .eq('user_id', userId)
+        .eq('date', today)
+        .maybeSingle();
 
-  // 1. Initializer Effect: Only runs when phase or settings change AND timer is NOT active
+      if (error) throw error;
+      if (data) {
+        setDailyStats({
+          date: data.date,
+          count: data.sessions_count || 0,
+          totalSeconds: data.total_seconds || 0
+        });
+        setCycleCount(data.cycle_count || 0);
+      }
+    } catch (err: any) {
+      console.error("Gagal mengambil statistik Pomodoro:", err.message);
+    }
+  };
+
+  const upsertPomodoroStats = async (newSeconds: number, isSessionComplete: boolean, newCycle?: number) => {
+    if (!session) return;
+    const userId = session.user.id;
+    const today = new Date().toDateString();
+    
+    // Calculate new values locally first
+    const updatedSeconds = dailyStats.totalSeconds + newSeconds;
+    const updatedCount = isSessionComplete ? dailyStats.count + 1 : dailyStats.count;
+    const updatedCycle = newCycle !== undefined ? newCycle : cycleCount;
+
+    // Update UI state immediately
+    setDailyStats({ date: today, count: updatedCount, totalSeconds: updatedSeconds });
+    if (newCycle !== undefined) setCycleCount(newCycle);
+
+    try {
+      const { error } = await supabase
+        .from('pomodoro_stats')
+        .upsert({
+          user_id: userId,
+          date: today,
+          total_seconds: updatedSeconds,
+          sessions_count: updatedCount,
+          cycle_count: updatedCycle
+        }, { onConflict: 'user_id,date' });
+
+      if (error) throw error;
+    } catch (err: any) {
+      console.error("Gagal sinkronisasi statistik Pomodoro:", err.message);
+    }
+  };
+
+  // --- TIMER LOGIC ---
+
+  // Initializer: Set time when phase or settings change, but only if timer is NOT running
   useEffect(() => {
     if (!isActive) {
       const duration = appSettings.pomodoro[phase] * 60;
@@ -200,7 +254,7 @@ const App: React.FC = () => {
     }
   }, [phase, appSettings.pomodoro]);
 
-  // 2. Ticker Effect: Runs only when isActive is true
+  // Main Loop
   useEffect(() => {
     if (isActive) {
       timerRef.current = window.setInterval(() => {
@@ -222,31 +276,22 @@ const App: React.FC = () => {
     setIsActive(false);
     playNotificationSound();
     
-    // Log time and update stats
     if (phase === 'work') {
-      const workDuration = sessionTotalDuration; 
+      const workDuration = sessionTotalDuration;
       logTimeForActiveTask(workDuration);
-      updateDailyStats(workDuration, true);
-    }
-    
-    // Cycle Management
-    let nextPhase: Phase = 'work';
-    if (phase === 'work') {
+      
+      const newCycle = (cycleCount + 1) % 4;
+      upsertPomodoroStats(workDuration, true, newCycle);
+      
       sendNotification("Fokus Selesai!", "Kerja bagus! Waktunya istirahat.");
-      const newCycle = cycleCount + 1;
-      setCycleCount(newCycle);
-      nextPhase = (newCycle >= 4) ? 'longBreak' : 'shortBreak';
-      if (newCycle >= 4) setCycleCount(0);
+      setPhase(newCycle === 0 ? 'longBreak' : 'shortBreak');
     } else {
-      nextPhase = 'work';
       sendNotification("Istirahat Selesai!", "Ayo kembali fokus bekerja.");
+      setPhase('work');
     }
 
-    setPhase(nextPhase);
-    
     if (appSettings.pomodoro.autoStart) {
-      // Small timeout to allow state to settle
-      setTimeout(() => setIsActive(true), 100);
+      setTimeout(() => setIsActive(true), 200);
     }
   };
 
@@ -258,7 +303,6 @@ const App: React.FC = () => {
     const newLogged = task.timeLogged + secondsWorked;
     const updates: Partial<Task> = { timeLogged: newLogged };
     
-    // Automatically complete if log meets estimate
     if ((newLogged / 60) >= task.timeEstimate) {
       updates.status = 'completed';
       updates.timeLogged = task.timeEstimate * 60;
@@ -268,19 +312,25 @@ const App: React.FC = () => {
     updateTaskInSupabase(activeTaskId, updates);
   };
 
-  const updateDailyStats = (secondsToAdd: number, isSessionComplete: boolean) => {
-    const today = new Date().toDateString();
-    setDailyStats(prev => {
-      const sameDay = prev.date === today;
-      return {
-        date: today,
-        count: isSessionComplete ? (sameDay ? prev.count + 1 : 1) : (sameDay ? prev.count : 0),
-        totalSeconds: sameDay ? prev.totalSeconds + secondsToAdd : secondsToAdd
-      };
-    });
+  const handleToggleTimer = () => setIsActive(!isActive);
+
+  const handleStopTimer = () => {
+    if (phase === 'work' && isActive) {
+      const elapsed = sessionTotalDuration - timeLeft;
+      if (elapsed > 0) {
+        logTimeForActiveTask(elapsed);
+        upsertPomodoroStats(elapsed, false);
+      }
+    }
+    
+    setIsActive(false);
+    setActiveTaskId(null);
+    const defaultWork = appSettings.pomodoro.work * 60;
+    setTimeLeft(defaultWork);
+    setSessionTotalDuration(defaultWork);
+    setPhase('work');
   };
 
-  // --- HANDLERS ---
   const handleStartPomodoro = (taskId: string) => {
     const task = tasks.find(t => t.id === taskId);
     if (!task) return;
@@ -294,25 +344,6 @@ const App: React.FC = () => {
     setSessionTotalDuration(duration);
     setIsActive(true);
     setActivePage('pomodoro');
-  };
-
-  const handleToggleTimer = () => setIsActive(!isActive);
-
-  const handleStopTimer = () => {
-    if (phase === 'work' && activeTaskId) {
-      const elapsed = sessionTotalDuration - timeLeft;
-      if (elapsed > 10) { // Only log if more than 10s elapsed
-        logTimeForActiveTask(elapsed);
-        updateDailyStats(elapsed, false);
-      }
-    }
-    
-    setIsActive(false);
-    setActiveTaskId(null);
-    setPhase('work');
-    const defaultWork = appSettings.pomodoro.work * 60;
-    setTimeLeft(defaultWork);
-    setSessionTotalDuration(defaultWork);
   };
 
   const handleLogout = async () => {
